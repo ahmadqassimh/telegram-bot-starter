@@ -1,82 +1,115 @@
-#!/usr/bin/env python
-# pylint: disable=unused-argument
-# This program is dedicated to the public domain under the CC0 license.
-
-"""
-Simple Bot to reply to Telegram messages.
-
-First, a few handler functions are defined. Then, those functions are passed to
-the Application and registered at their respective places.
-Then, the bot is started and runs until we press Ctrl-C on the command line.
-
-Usage:
-Basic Echobot example, repeats messages.
-Press Ctrl-C on the command line or send a signal to the process to stop the
-bot.
-"""
-
-import logging
 import os
+import asyncio
+import logging
+from telethon import TelegramClient, events
+import google.generativeai as genai
+from flask import Flask
+from threading import Thread
 
-from dotenv import load_dotenv
-from telegram import ForceReply, Update
-from telegram.ext import Application, ContextTypes
+# ====== Keep Alive ======
+app = Flask('')
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-# set higher logging level for httpx to avoid all GET and POST requests being logged
-logging.getLogger("httpx").setLevel(logging.WARNING)
+@app.route('/')
+def home():
+    return "✅ Bot is running."
 
+def run():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# ====== Config from environment ======
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+SESSION_NAME = 'user'
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PRIVATE_CHANNEL = int(os.getenv("PRIVATE_CHANNEL"))
+
+SOURCE_CHANNELS = [
+    'aeeeioo',
+    -1001878871385,
+    -1001609322224,
+    -1001941966833,
+]
+
+# ====== Logging ======
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ====== Gemini + Telethon Init ======
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Define a few command handlers. These usually take the two arguments update and
-# context.
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    await update.message.reply_html(
-        rf"Hi {user.mention_html()}!",
-        reply_markup=ForceReply(selective=True),
-    )
+async def authenticate():
+    await client.connect()
+    if await client.is_user_authorized():
+        logger.info("✅ Logged in via saved session.")
+        return
+    try:
+        await client.send_code_request(PHONE_NUMBER)
+        code = input("🔢 Enter the code sent to your Telegram: ").strip()
+        await client.sign_in(PHONE_NUMBER, code)
+        logger.info("✅ Authentication successful.")
+    except Exception as e:
+        logger.error(f"❌ Login failed: {e}")
+        await client.disconnect()
+        exit(1)
 
+async def format_signal(text):
+    prompt = f"""
+تنسيق هذه التوصية بشكل احترافي ضمن القالب التالي:
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    await update.message.reply_text("Help!")
+🔔 <الزوج> <BUY أو SELL>
 
+📊 AT: <سعر الدخول>
+❌ SL: <سعر وقف الخسارة>
+✅ TP1: <الهدف الأول>
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Echo the user message."""
-    await update.message.reply_text(update.message.text)
+⚠️ الصفقة عالية المخاطر، عليك بإدارة رأس المال.
 
+---
+
+التوصية:
+{text}
+
+أعد تنسيقها ضمن القالب أعلاه فقط، بدون أي شرح إضافي. إذا كانت التوصية غير مفهومة لا ترد.
+"""
+    try:
+        response = model.generate_content(prompt)
+        result = response.text.strip()
+        if result.startswith("🔔") and "SL" in result:
+            return result
+    except Exception as e:
+        logger.error(f"⚠️ Gemini error: {e}")
+    return None
+
+@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+async def handle_source_message(event):
+    text = event.message.text
+    if not text:
+        return
+
+    logger.info(f"📩 Message from {event.chat_id}")
+    formatted = await format_signal(text)
+    if formatted:
+        await client.send_message(PRIVATE_CHANNEL, formatted)
+        logger.info("📤 Sent formatted signal.")
+    else:
+        logger.info("⚠️ Skipped: Could not format message.")
+
+async def main():
+    print("🤖 Bot starting...")
+    await authenticate()
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    load_dotenv()
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    dev_mode = os.environ.get("DEV_MODE", "False").lower() == "True"
-
-    application = Application.builder().token(token).build()
-
-    if dev_mode:
-        # Webhook settings
-        webhook_url = os.environ.get("WEBHOOK_URL")
-        port = int(os.environ.get("PORT", 8443))
-
-        # Set webhook
-        application.bot.set_webhook(
-            url=f"{webhook_url}/{token}",
-            drop_pending_updates=True
-        )
-
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=token,
-            webhook_url=f"{webhook_url}/{token}"
-        )
-    else:
-        application.run_polling()
-
+    keep_alive()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped.")
